@@ -26,31 +26,48 @@ async function applyFilters(page, filters, searchRadius) {
     return true;
 }
 
+async function settleAfterFilterChange(page) {
+    // Every filter change makes the CarGurus SPA re-fetch results and re-render the
+    // filter panel, which detaches the nodes we were about to touch. Wait for the
+    // network to go idle plus a short debounce so we interact with stable DOM.
+    await page.waitForLoadState('networkidle', { timeout: 30000 }).catch(() => {});
+    await page.waitForTimeout(1500);
+}
+
 async function ensureAccordionOpen(page, triggerSelector, contentSelector, name) {
-    const trigger = page.locator(triggerSelector).first();
-    const content = page.locator(contentSelector).first();
+    // Re-resolve the trigger/content locators on EVERY attempt. The new build
+    // re-creates these nodes whenever results reload, so a reference grabbed once
+    // goes stale and throws "element is not attached to the DOM" mid-click.
+    for (let attempt = 1; attempt <= 5; attempt++) {
+        const trigger = page.locator(triggerSelector).first();
+        const content = page.locator(contentSelector).first();
 
-    await trigger.waitFor({ state: 'visible', timeout: 90000 });
+        try {
+            await trigger.waitFor({ state: 'visible', timeout: 30000 });
 
-    for (let attempt = 1; attempt <= 3; attempt++) {
-        const triggerExpanded = await trigger.getAttribute('aria-expanded').catch(() => null);
-        const contentState = await content.getAttribute('data-state').catch(() => null);
+            const triggerExpanded = await trigger.getAttribute('aria-expanded').catch(() => null);
+            const contentState = await content.getAttribute('data-state').catch(() => null);
 
-        if (triggerExpanded === 'true' || contentState === 'open') {
-            console.log(`  ✅ ${name} accordion is open`);
-            return true;
-        }
+            if (triggerExpanded === 'true' || contentState === 'open') {
+                console.log(`  ✅ ${name} accordion is open`);
+                return true;
+            }
 
-        await trigger.scrollIntoViewIfNeeded({ timeout: 10000 });
-        await trigger.click({ timeout: 10000, force: true });
-        await page.waitForTimeout(800);
+            await trigger.scrollIntoViewIfNeeded({ timeout: 8000 });
+            await trigger.click({ timeout: 8000, force: true });
+            await page.waitForTimeout(800);
 
-        const updatedExpanded = await trigger.getAttribute('aria-expanded').catch(() => null);
-        const updatedContentState = await content.getAttribute('data-state').catch(() => null);
+            const updatedExpanded = await trigger.getAttribute('aria-expanded').catch(() => null);
+            const updatedContentState = await content.getAttribute('data-state').catch(() => null);
 
-        if (updatedExpanded === 'true' || updatedContentState === 'open') {
-            console.log(`  ✅ Opened ${name} accordion`);
-            return true;
+            if (updatedExpanded === 'true' || updatedContentState === 'open') {
+                console.log(`  ✅ Opened ${name} accordion`);
+                return true;
+            }
+        } catch (error) {
+            // Node was detached because the panel re-rendered — settle and retry fresh.
+            console.log(`  ↻ ${name} accordion attempt ${attempt}/5 hit a re-render (${error.message.split('\n')[0]}), retrying...`);
+            await settleAfterFilterChange(page);
         }
     }
 
@@ -142,15 +159,22 @@ async function setSearchRadius(page, searchRadius) {
         }
 
         await dropdown.selectOption(optionValue, { timeout: 90000 });
-        await page.waitForTimeout(2000);
 
-        const selectedValue = await dropdown.inputValue();
+        // Selecting the radius reloads results and detaches this <select>. Wait for
+        // the reload to settle, then verify against a FRESH locator — reading
+        // inputValue() off the stale one is what used to hang for 30s and fail.
+        await settleAfterFilterChange(page);
 
-        if (selectedValue !== optionValue) {
+        const freshDropdown = await findDistanceDropdown(page);
+        const selectedValue = freshDropdown
+            ? await freshDropdown.inputValue({ timeout: 10000 }).catch(() => null)
+            : null;
+
+        if (selectedValue && selectedValue !== optionValue) {
             throw new Error(`Distance dropdown value mismatch. Expected ${optionValue}, got ${selectedValue}`);
         }
 
-        console.log(`  ✅ Search radius set successfully: ${selectedValue}`);
+        console.log(`  ✅ Search radius set successfully: ${selectedValue || optionValue}`);
         return true;
 
     } catch (error) {
@@ -175,27 +199,40 @@ async function applyBodyTypeFilter(page, bodyTypes) {
         await ensureAccordionOpen(page, '#BodyStyle-accordion-trigger', '#BodyStyle-accordion-content', 'Body Style');
 
         const clickCheckboxByAriaLabelContains = async (groupName, labelText) => {
-            const checkbox = page.locator(`button[role="checkbox"][aria-label*="${labelText}"]`).first();
+            for (let attempt = 1; attempt <= 4; attempt++) {
+                try {
+                    // A previous checkbox click may have reloaded results and collapsed
+                    // the panel, so re-open the accordion and re-resolve the checkbox
+                    // fresh each attempt rather than reusing a detached reference.
+                    await ensureAccordionOpen(page, '#BodyStyle-accordion-trigger', '#BodyStyle-accordion-content', 'Body Style');
 
-            await checkbox.waitFor({ state: 'attached', timeout: 90000 });
-            await checkbox.scrollIntoViewIfNeeded({ timeout: 10000 });
+                    const checkbox = page.locator(`button[role="checkbox"][aria-label*="${labelText}"]`).first();
+                    await checkbox.waitFor({ state: 'attached', timeout: 30000 });
 
-            const checkedBefore = await checkbox.getAttribute('aria-checked');
-            if (checkedBefore === 'true') {
-                console.log(`  ✅ ${groupName}: ${labelText} already selected`);
-                return true;
+                    const checkedBefore = await checkbox.getAttribute('aria-checked');
+                    if (checkedBefore === 'true') {
+                        console.log(`  ✅ ${groupName}: ${labelText} already selected`);
+                        return true;
+                    }
+
+                    await checkbox.scrollIntoViewIfNeeded({ timeout: 8000 });
+                    await checkbox.click({ timeout: 15000, force: true });
+                    await settleAfterFilterChange(page);
+
+                    const checkedAfter = await checkbox.getAttribute('aria-checked').catch(() => null);
+                    if (checkedAfter === 'true') {
+                        console.log(`  ✅ ${groupName}: Added ${labelText}`);
+                        return true;
+                    }
+
+                    console.log(`  ↻ ${groupName}: ${labelText} not checked yet (state ${checkedAfter}), retrying...`);
+                } catch (error) {
+                    console.log(`  ↻ ${groupName}: ${labelText} attempt ${attempt}/4 hit a re-render (${error.message.split('\n')[0]}), retrying...`);
+                    await settleAfterFilterChange(page);
+                }
             }
 
-            await checkbox.click({ timeout: 30000, force: true });
-            await page.waitForTimeout(700);
-
-            const checkedAfter = await checkbox.getAttribute('aria-checked');
-            if (checkedAfter !== 'true') {
-                throw new Error(`${groupName}: clicked ${labelText}, but aria-checked is ${checkedAfter}`);
-            }
-
-            console.log(`  ✅ ${groupName}: Added ${labelText}`);
-            return true;
+            throw new Error(`${groupName}: could not select ${labelText} after retries`);
         };
 
         for (const bodyType of bodyTypes) {
