@@ -26,32 +26,66 @@ async function applyFilters(page, filters, searchRadius) {
     return true;
 }
 
+// ============================================
+// CHURN-PROOF INTERACTION HELPERS
+// CarGurus' filter panel re-renders continuously as its live listing counts
+// update, so Playwright clicks (which wait for the node to be attached AND
+// stable) time out against a remounting element. These act on the node
+// synchronously inside the page — the click lands before the next re-render —
+// then verify via detach-proof reads, polling through transient nulls so we
+// never click twice and toggle a control back off.
+// ============================================
+
+async function waitForSelectorAttached(page, selector, timeout = 90000) {
+    await page.locator(selector).first().waitFor({ state: 'attached', timeout });
+}
+
+async function clickInPage(page, selector) {
+    return page.evaluate((sel) => {
+        const el = document.querySelector(sel);
+        if (!el) return false;
+        el.click();
+        return true;
+    }, selector);
+}
+
+async function readAttr(page, selector, attr) {
+    return page.evaluate(({ sel, a }) => {
+        const el = document.querySelector(sel);
+        return el ? el.getAttribute(a) : null;
+    }, { sel: selector, a: attr });
+}
+
+// Click `clickSelector` in-page and poll `checkFn` until it resolves truthy,
+// tolerating transient nulls from re-renders. Returns true on success.
+async function clickUntilState(page, clickSelector, checkFn, opts = {}) {
+    const { clickAttempts = 6, pollCount = 12, pollGap = 250 } = opts;
+    if (await checkFn()) return true;
+    for (let a = 1; a <= clickAttempts; a++) {
+        await clickInPage(page, clickSelector);
+        for (let i = 0; i < pollCount; i++) {
+            await page.waitForTimeout(pollGap);
+            if (await checkFn()) return true;
+        }
+    }
+    return false;
+}
+
 async function ensureAccordionOpen(page, triggerSelector, contentSelector, name) {
-    const trigger = page.locator(triggerSelector).first();
-    const content = page.locator(contentSelector).first();
+    const openNow = async () =>
+        (await readAttr(page, triggerSelector, 'aria-expanded')) === 'true' ||
+        (await readAttr(page, contentSelector, 'data-state')) === 'open';
 
-    await trigger.waitFor({ state: 'visible', timeout: 90000 });
+    await waitForSelectorAttached(page, triggerSelector);
 
-    for (let attempt = 1; attempt <= 3; attempt++) {
-        const triggerExpanded = await trigger.getAttribute('aria-expanded').catch(() => null);
-        const contentState = await content.getAttribute('data-state').catch(() => null);
+    if (await openNow()) {
+        console.log(`  ✅ ${name} accordion is open`);
+        return true;
+    }
 
-        if (triggerExpanded === 'true' || contentState === 'open') {
-            console.log(`  ✅ ${name} accordion is open`);
-            return true;
-        }
-
-        await trigger.scrollIntoViewIfNeeded({ timeout: 10000 });
-        await trigger.click({ timeout: 10000, force: true });
-        await page.waitForTimeout(800);
-
-        const updatedExpanded = await trigger.getAttribute('aria-expanded').catch(() => null);
-        const updatedContentState = await content.getAttribute('data-state').catch(() => null);
-
-        if (updatedExpanded === 'true' || updatedContentState === 'open') {
-            console.log(`  ✅ Opened ${name} accordion`);
-            return true;
-        }
+    if (await clickUntilState(page, triggerSelector, openNow)) {
+        console.log(`  ✅ Opened ${name} accordion`);
+        return true;
     }
 
     throw new Error(`${name} accordion did not open`);
@@ -142,15 +176,30 @@ async function setSearchRadius(page, searchRadius) {
         }
 
         await dropdown.selectOption(optionValue, { timeout: 90000 });
-        await page.waitForTimeout(2000);
 
-        const selectedValue = await dropdown.inputValue();
+        // Changing the radius makes CarGurus recompute every listing count in the
+        // filter panel, which remounts the <select>. Verify with fresh re-queries
+        // (never a held locator) so a mid-render detach doesn't hang inputValue().
+        let selectedValue = null;
+        for (let attempt = 0; attempt < 15; attempt++) {
+            await page.waitForTimeout(1000);
+            selectedValue = await page.evaluate(() => {
+                const select = document.querySelector(
+                    'select[data-testid="select-filter-distance"], select[aria-label="Distance from me"]'
+                );
+                return select ? select.value : null;
+            });
+            if (selectedValue === optionValue) break;
+        }
 
-        if (selectedValue !== optionValue) {
+        // A concrete wrong value is a real failure; null just means the <select>
+        // was mid-remount for the whole verify window — selectOption() already
+        // succeeded (it throws on failure), so trust it instead of aborting.
+        if (selectedValue !== null && selectedValue !== optionValue) {
             throw new Error(`Distance dropdown value mismatch. Expected ${optionValue}, got ${selectedValue}`);
         }
 
-        console.log(`  ✅ Search radius set successfully: ${selectedValue}`);
+        console.log(`  ✅ Search radius set successfully: ${selectedValue ?? optionValue}`);
         return true;
 
     } catch (error) {
@@ -174,28 +223,29 @@ async function applyBodyTypeFilter(page, bodyTypes) {
 
         await ensureAccordionOpen(page, '#BodyStyle-accordion-trigger', '#BodyStyle-accordion-content', 'Body Style');
 
+        // CarGurus now renders a live listing count inside each option's aria-label
+        // (e.g. "SUV / Crossover (9,140)"). Those counts recompute whenever another
+        // filter changes, remounting the checkbox nodes — so any action that waits
+        // for the element to be "stable" (scrollIntoViewIfNeeded) loses it mid-flight
+        // with "not attached to the DOM". Match by aria-label prefix, read state via
+        // a detach-proof querySelector, and click a freshly-resolved locator on retry.
         const clickCheckboxByAriaLabelContains = async (groupName, labelText) => {
-            const checkbox = page.locator(`button[role="checkbox"][aria-label*="${labelText}"]`).first();
+            const selector = `button[role="checkbox"][aria-label^="${labelText}"]`;
+            const isChecked = async () => (await readAttr(page, selector, 'aria-checked')) === 'true';
 
-            await checkbox.waitFor({ state: 'attached', timeout: 90000 });
-            await checkbox.scrollIntoViewIfNeeded({ timeout: 10000 });
+            await waitForSelectorAttached(page, selector);
 
-            const checkedBefore = await checkbox.getAttribute('aria-checked');
-            if (checkedBefore === 'true') {
+            if (await isChecked()) {
                 console.log(`  ✅ ${groupName}: ${labelText} already selected`);
                 return true;
             }
 
-            await checkbox.click({ timeout: 30000, force: true });
-            await page.waitForTimeout(700);
-
-            const checkedAfter = await checkbox.getAttribute('aria-checked');
-            if (checkedAfter !== 'true') {
-                throw new Error(`${groupName}: clicked ${labelText}, but aria-checked is ${checkedAfter}`);
+            if (await clickUntilState(page, selector, isChecked)) {
+                console.log(`  ✅ ${groupName}: Added ${labelText}`);
+                return true;
             }
 
-            console.log(`  ✅ ${groupName}: Added ${labelText}`);
-            return true;
+            throw new Error(`${groupName}: clicked ${labelText}, but aria-checked never became true`);
         };
 
         for (const bodyType of bodyTypes) {
@@ -237,45 +287,48 @@ function normalizeMakeName(make) {
 async function clickMakeCheckbox(page, make) {
     const normalizedMake = normalizeMakeName(make);
 
-    const selectors = [
+    // querySelector-compatible click candidates (dropped the Playwright-only
+    // `label:has-text()` fallbacks — the id/data-testid/aria-label paths cover
+    // every make). Verify against the canonical checkbox id.
+    const verifySelector = `button[role="checkbox"][id="FILTER.MAKE_MODEL.${normalizedMake}"]`;
+    const clickSelectors = [
         `button[data-testid="checkbox-FILTER.MAKE_MODEL.${normalizedMake}"]`,
         `button[data-cg-ft="checkbox-FILTER.MAKE_MODEL.${normalizedMake}"]`,
         `button[id="FILTER.MAKE_MODEL.${normalizedMake}"]`,
         `button[role="checkbox"][aria-label="${make}"]`,
         `button[role="checkbox"][aria-label="${normalizedMake}"]`,
-        `label:has-text("${make}")`,
-        `label:has-text("${normalizedMake}")`,
     ];
 
-    for (const selector of selectors) {
-        const locator = page.locator(selector).first();
+    const isChecked = async () => (await readAttr(page, verifySelector, 'aria-checked')) === 'true';
 
-        try {
-            await locator.waitFor({ state: 'attached', timeout: 3000 });
-            await locator.scrollIntoViewIfNeeded({ timeout: 5000 });
-            await page.waitForTimeout(300);
+    try {
+        await waitForSelectorAttached(page, verifySelector, 15000);
+    } catch (_) {
+        // Some makes render only under an aria-label match — keep going.
+    }
 
-            const checkbox = page.locator(`button[role="checkbox"][id="FILTER.MAKE_MODEL.${normalizedMake}"]`).first();
-            const checkedBefore = await checkbox.getAttribute('aria-checked').catch(() => null);
+    if (await isChecked()) {
+        console.log(`  ✅ ${make} already selected`);
+        return true;
+    }
 
-            if (checkedBefore === 'true') {
-                console.log(`  ✅ ${make} already selected`);
+    for (let attempt = 1; attempt <= 6; attempt++) {
+        let clicked = false;
+        for (const sel of clickSelectors) {
+            if (await clickInPage(page, sel)) { clicked = true; break; }
+        }
+
+        if (!clicked) {
+            await page.waitForTimeout(400);
+            continue;
+        }
+
+        for (let i = 0; i < 12; i++) {
+            await page.waitForTimeout(250);
+            if (await isChecked()) {
+                console.log(`  ✅ Added ${make}`);
                 return true;
             }
-
-            await locator.click({ timeout: 10000, force: true });
-            await page.waitForTimeout(700);
-
-            const checkedAfter = await checkbox.getAttribute('aria-checked').catch(() => null);
-
-            if (checkedAfter === 'true') {
-                console.log(`  ✅ Added ${make} using selector: ${selector}`);
-                return true;
-            }
-
-            console.log(`  ⚠️ Clicked ${make}, but checkbox state is still: ${checkedAfter}`);
-        } catch (_) {
-            // Try next selector
         }
     }
 
@@ -404,27 +457,24 @@ async function applyPriceDropsFilter(page) {
             await page.waitForTimeout(600);
         }
 
-        const checkbox = page.locator(checkboxSelector).first();
-        await checkbox.waitFor({ state: 'attached', timeout: 90000 });
-        await checkbox.scrollIntoViewIfNeeded({ timeout: 10000 });
+        // Same live-count remount hazard as the other filters — use the shared
+        // churn-proof in-page click + polled verify helper.
+        const isChecked = async () => (await readAttr(page, checkboxSelector, 'aria-checked')) === 'true';
 
-        const checkedBefore = await checkbox.getAttribute('aria-checked');
-        if (checkedBefore === 'true') {
+        await waitForSelectorAttached(page, checkboxSelector);
+
+        if (await isChecked()) {
             console.log(`  ✅ Price drops already enabled`);
             return true;
         }
 
-        await checkbox.click({ timeout: 30000, force: true });
-        await page.waitForTimeout(800);
-
-        const checkedAfter = await checkbox.getAttribute('aria-checked');
-        if (checkedAfter !== 'true') {
-            throw new Error(`Clicked Price drops, but aria-checked is ${checkedAfter}`);
+        if (await clickUntilState(page, checkboxSelector, isChecked)) {
+            console.log(`  ✅ Price drops enabled`);
+            await page.waitForTimeout(2000);
+            return true;
         }
 
-        console.log(`  ✅ Price drops enabled`);
-        await page.waitForTimeout(2000);
-        return true;
+        throw new Error(`Clicked Price drops, but aria-checked never became true`);
     } catch (error) {
         console.log(`  ❌ Price drops filter failed: ${error.message}`);
         return false;
