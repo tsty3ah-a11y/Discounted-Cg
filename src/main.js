@@ -281,6 +281,9 @@ async function applyBodyTypeFilter(page, bodyTypes) {
 function normalizeMakeName(make) {
     const map = {
         ram: 'RAM',
+        // CarGurus spells it "Kia", so an input of "KIA" would build a testid that
+        // matches nothing — and one unmatched make aborts the whole run.
+        kia: 'Kia',
         gmc: 'GMC',
         bmw: 'BMW',
         fiat: 'FIAT',
@@ -463,6 +466,82 @@ async function applyDealRatingFilter(page, dealRatings) {
     }
 }
 
+// The redesigned SRP mounts accordion contents lazily: a collapsed section's
+// controls are absent from the DOM entirely, not merely hidden. Clicking the
+// section open is therefore a precondition for finding the checkbox at all.
+//
+// Only ever called after the normal probe has already come up empty, so it
+// cannot affect a run that currently succeeds.
+// `stage` 1 = targeted (click the trigger that names the section),
+// `stage` 2 = broad (open every collapsed section, since we can't be certain
+// which one owns the control). Returns true only if something was actually
+// clicked, so the caller knows whether a re-probe is worth the time.
+async function openPriceDropsSection(page, stage) {
+    // Scope to the filter panel so we never click chrome outside it (nav menus,
+    // cookie banners). If we can't identify the panel we do nothing, which
+    // leaves today's behaviour exactly as it is.
+    const panelSelectors = ['[data-testid="desktop-filters-panel"]', '[data-testid="accordion-wrapper"]'];
+    let panel = null;
+    for (const sel of panelSelectors) {
+        const loc = page.locator(sel).first();
+        if (await loc.count().then((n) => n > 0).catch(() => false)) {
+            panel = loc;
+            break;
+        }
+    }
+    if (!panel) {
+        console.log('  ℹ️ No filter panel container found — skipping section expansion');
+        return false;
+    }
+
+    if (stage === 1) {
+        const named = panel.getByRole('button', { name: /price\s*drop/i }).first();
+        if (await named.count().then((n) => n > 0).catch(() => false)) {
+            const expanded = await named.getAttribute('aria-expanded').catch(() => null);
+            if (expanded !== 'true') {
+                await named.scrollIntoViewIfNeeded({ timeout: 5000 }).catch(() => {});
+                await named.click({ timeout: 8000, force: true }).catch(() => {});
+                await page.waitForTimeout(900);
+                console.log('  📂 Clicked the "Price drops" section trigger');
+                return true;
+            }
+        }
+        return false;
+    }
+
+    // Repeated passes because each click re-renders the list and invalidates
+    // the indices we're iterating over.
+    let opened = 0;
+    for (let pass = 1; pass <= 3; pass++) {
+        const triggers = panel.locator('button[aria-expanded="false"], [role="button"][aria-expanded="false"]');
+        const count = await triggers.count().catch(() => 0);
+        if (count === 0) break;
+
+        let clickedThisPass = 0;
+        for (let i = 0; i < count; i++) {
+            const trigger = triggers.nth(i);
+            try {
+                if (await trigger.getAttribute('aria-expanded') !== 'false') continue;
+                await trigger.scrollIntoViewIfNeeded({ timeout: 3000 });
+                await trigger.click({ timeout: 3000, force: true });
+                clickedThisPass++;
+                opened++;
+                await page.waitForTimeout(250);
+            } catch (_) {
+                // Detached mid-iteration — the next pass re-reads the list.
+            }
+        }
+        if (clickedThisPass === 0) break;
+    }
+
+    if (opened > 0) {
+        console.log(`  📂 Expanded ${opened} collapsed filter section(s)`);
+        await page.waitForTimeout(1000);
+        return true;
+    }
+    return false;
+}
+
 async function applyPriceDropsFilter(page) {
     try {
         console.log(`📉 Enabling "Price drops" filter`);
@@ -486,22 +565,35 @@ async function applyPriceDropsFilter(page) {
             'button[role="checkbox"][id="FILTER.HAS_RECENT_PRICE_DROPS"]',
             'button[role="checkbox"][aria-label*="Price drop" i]',
             '[data-testid*="HAS_RECENT_PRICE_DROPS"]',
+            '[data-testid^="checkbox-FILTER."][data-testid*="PRICE_DROP" i]',
+            'input[type="checkbox"][id*="PRICE_DROP" i]',
         ];
 
-        let checkbox = null;
-        let usedSelector = null;
+        // Probe every candidate with a short timeout. The original 90s wait on a
+        // single selector burnt the whole attempt before the others were tried.
+        const probeCandidates = async (timeout) => {
+            for (const sel of candidates) {
+                const loc = page.locator(sel).first();
+                const found = await loc.waitFor({ state: 'attached', timeout })
+                    .then(() => true)
+                    .catch(() => false);
+                if (found) return { checkbox: loc, usedSelector: sel };
+            }
+            return { checkbox: null, usedSelector: null };
+        };
 
-        for (const sel of candidates) {
-            const loc = page.locator(sel).first();
-            // Short probe per candidate — the classic 90s wait would burn the whole
-            // run on the first selector before we ever tried the others.
-            const found = await loc.waitFor({ state: 'attached', timeout: 8000 })
-                .then(() => true)
-                .catch(() => false);
-            if (found) {
-                checkbox = loc;
-                usedSelector = sel;
-                break;
+        let { checkbox, usedSelector } = await probeCandidates(8000);
+
+        if (!checkbox) {
+            // Nothing matched. On the redesigned SRP that means the owning section
+            // is collapsed and its contents were never rendered — open it and retry.
+            // Short probe timeout on the retries: if the section is open the control
+            // is already in the DOM, so waiting longer buys nothing.
+            console.log('  ⚠️ Price drops checkbox not in the DOM — expanding filter sections and retrying');
+            for (const stage of [1, 2]) {
+                if (!await openPriceDropsSection(page, stage)) continue;
+                ({ checkbox, usedSelector } = await probeCandidates(3000));
+                if (checkbox) break;
             }
         }
 
@@ -517,7 +609,17 @@ async function applyPriceDropsFilter(page) {
 
         await checkbox.scrollIntoViewIfNeeded({ timeout: 10000 }).catch(() => {});
 
-        const checkedBefore = await checkbox.getAttribute('aria-checked');
+        // A native <input type="checkbox"> carries no aria-checked, so fall back to
+        // the DOM property. Returns 'true'/'false' to keep the comparisons below intact.
+        const readChecked = async (locator) => locator
+            .evaluate((el) => {
+                const aria = el.getAttribute('aria-checked');
+                if (aria !== null) return aria;
+                return typeof el.checked === 'boolean' ? String(el.checked) : null;
+            })
+            .catch(() => null);
+
+        const checkedBefore = await readChecked(checkbox);
         if (checkedBefore === 'true') {
             console.log(`  ✅ Price drops already enabled`);
             return true;
@@ -526,8 +628,7 @@ async function applyPriceDropsFilter(page) {
         await checkbox.click({ timeout: 30000, force: true });
         await page.waitForTimeout(800);
 
-        const checkedAfter = await page.locator(usedSelector).first()
-            .getAttribute('aria-checked').catch(() => null);
+        const checkedAfter = await readChecked(page.locator(usedSelector).first());
         if (checkedAfter !== 'true') {
             // Reuse the detach-proof clicker before giving up — the filter panel
             // re-renders live result counts and can detach the element mid-click.
@@ -676,7 +777,35 @@ async function captureVariantDiagnostics(page, label) {
                 const k = el.getAttribute('data-testid');
                 ids[k] = (ids[k] || 0) + 1;
             });
-            out.testIds = Object.entries(ids).sort((a, b) => b[1] - a[1]).slice(0, 60);
+            // Cap raised from 60: sorting by frequency pushed every single-occurrence
+            // filter testid (checkbox-FILTER.*) past the cut, which is exactly the
+            // set we need to read the real selector back from.
+            out.testIds = Object.entries(ids).sort((a, b) => b[1] - a[1]).slice(0, 400);
+
+            // Every filter control in the panel, with enough attributes to build a
+            // selector from without guessing. Also records which sections are open,
+            // since the redesigned SRP does not mount a collapsed section's contents.
+            out.filterControls = Array.from(document.querySelectorAll(
+                '[role="checkbox"], input[type="checkbox"], [data-testid^="checkbox-"]'
+            )).slice(0, 200).map((el) => ({
+                tag: el.tagName.toLowerCase(),
+                testid: el.getAttribute('data-testid'),
+                id: el.getAttribute('id'),
+                aria: el.getAttribute('aria-label'),
+                checked: el.getAttribute('aria-checked'),
+                text: (el.closest('li,label,div')?.textContent || '').trim().slice(0, 40),
+            }));
+
+            out.filterSections = Array.from(document.querySelectorAll('[aria-expanded], [data-state]'))
+                .slice(0, 80)
+                .map((el) => ({
+                    tag: el.tagName.toLowerCase(),
+                    testid: el.getAttribute('data-testid'),
+                    id: el.getAttribute('id'),
+                    expanded: el.getAttribute('aria-expanded'),
+                    state: el.getAttribute('data-state'),
+                    text: (el.textContent || '').trim().slice(0, 40),
+                }));
 
             // Anchors that point at a vehicle detail page = the cards, whatever they're called now
             const vdpRe = /(inventorylisting|vdp\.action|\/Cars\/link\/|listingId=)/i;
@@ -722,6 +851,18 @@ async function captureVariantDiagnostics(page, label) {
         // Compact summary straight into the Apify run log (greppable, no KV needed)
         console.log(`  🔬 [diag:${label}] cardSel=${diag.scraperCardSelector} nextBtn=${diag.scraperNextButton} vdpAnchors=${diag.vdpAnchorCount} iframes=${diag.iframes} blocked=${diag.looksBlocked} zip=${diag.zipInUrl} results="${diag.resultCountText}"`);
         console.log(`  🔬 [diag:${label}] topTestIds=${JSON.stringify(diag.testIds.slice(0, 12))}`);
+        // Surface anything price-drop-shaped straight in the log so the real
+        // selector is one grep away instead of a KV download.
+        const pdRe = /price[\s_-]?drop/i;
+        const pdControls = (diag.filterControls || []).filter((c) =>
+            pdRe.test(`${c.testid} ${c.id} ${c.aria} ${c.text}`));
+        if (pdControls.length > 0) {
+            console.log(`  🔬 [diag:${label}] priceDropControls=${JSON.stringify(pdControls)}`);
+        }
+        const pdSections = (diag.filterSections || []).filter((s) => pdRe.test(`${s.testid} ${s.id} ${s.text}`));
+        if (pdSections.length > 0) {
+            console.log(`  🔬 [diag:${label}] priceDropSections=${JSON.stringify(pdSections.slice(0, 6))}`);
+        }
         if (diag.vdpAnchorSample.length > 0) {
             console.log(`  🔬 [diag:${label}] cardAnchor=${JSON.stringify(diag.vdpAnchorSample[0])}`);
         }
